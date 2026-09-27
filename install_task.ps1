@@ -6,7 +6,11 @@ $pythonw = Join-Path (Split-Path (Get-Command python).Source) 'pythonw.exe'
 if (-not (Test-Path $pythonw)) { throw "pythonw.exe が見つかりません: $pythonw" }
 
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$script`"" -WorkingDirectory $PSScriptRoot
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+# ログオン時に起動。加えて5分ごとに起動を試み、プロセスが止まっていたら再開させる（動作中なら IgnoreNew で何もしない）
+$trigger = @(
+    New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+)
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `

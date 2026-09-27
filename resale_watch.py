@@ -331,12 +331,16 @@ def run_once(state_path, label):
 
 
 def run_loop(state_path, label, interval):
-    try:
-        lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        lock.bind(("127.0.0.1", LOCK_PORT))
-    except OSError:
-        log.error("すでに別の監視プロセスが動いているため終了します")
-        return 1
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    for attempt in range(15):  # 再起動直後は前のプロセスの終了を少し待つ
+        try:
+            lock.bind(("127.0.0.1", LOCK_PORT))
+            break
+        except OSError:
+            time.sleep(1)
+    else:
+        log.info("別の監視プロセスが動いているため終了します")
+        return 0
 
     config = get_config()
     if not config.get("GMAIL_APP_PASSWORD"):
