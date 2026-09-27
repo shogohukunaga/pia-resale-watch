@@ -71,8 +71,12 @@ def read_env_file(path=ENV_FILE):
 def set_password():
     """アプリパスワードを画面に表示せずに入力させ、.env に書き込む。"""
     import getpass
-    password = getpass.getpass("Gmail アプリパスワード（貼り付けて Enter。表示されません）: ")
-    password = re.sub(r"\s", "", password)
+    if sys.stdin is not None and not sys.stdin.isatty():
+        password = sys.stdin.read()  # 例: Get-Clipboard | python resale_watch.py --set-password
+    else:
+        password = getpass.getpass("Gmail アプリパスワード（入力して Enter。表示されません）: ")
+    # 空白・改行・パイプで付く BOM などを除く（アプリパスワードは英字16文字）
+    password = re.sub(r"[^A-Za-z0-9]", "", password)
     if len(password) != 16:
         print(f"16文字ではありません（{len(password)}文字）。もう一度実行してください。")
         return 1
