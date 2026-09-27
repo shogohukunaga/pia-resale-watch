@@ -68,6 +68,26 @@ def read_env_file(path=ENV_FILE):
     return values
 
 
+def set_password():
+    """アプリパスワードを画面に表示せずに入力させ、.env に書き込む。"""
+    import getpass
+    password = getpass.getpass("Gmail アプリパスワード（貼り付けて Enter。表示されません）: ")
+    password = re.sub(r"\s", "", password)
+    if len(password) != 16:
+        print(f"16文字ではありません（{len(password)}文字）。もう一度実行してください。")
+        return 1
+    source = ENV_FILE if ENV_FILE.exists() else BASE_DIR / ".env.example"
+    lines = source.read_text(encoding="utf-8-sig").splitlines()
+    new_line = f"GMAIL_APP_PASSWORD={password}"
+    if any(line.startswith("GMAIL_APP_PASSWORD=") for line in lines):
+        lines = [new_line if line.startswith("GMAIL_APP_PASSWORD=") else line for line in lines]
+    else:
+        lines.append(new_line)
+    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"{ENV_FILE} に保存しました。")
+    return 0
+
+
 def get_config():
     """呼ぶたびに .env を読み直す（常駐中にパスワードを書き換えても再起動不要）。"""
     config = read_env_file()
@@ -339,7 +359,11 @@ def main(argv=None):
     p.add_argument("--interval", type=int, default=60, help=f"チェック間隔（秒、最小 {MIN_INTERVAL}）")
     p.add_argument("--test-mail", action="store_true", help="テストメールを送信して終了")
     p.add_argument("--check-file", metavar="HTML", help="保存済み HTML を判定して結果を表示（送信なし）")
+    p.add_argument("--set-password", action="store_true", help="Gmail アプリパスワードを入力して .env に保存")
     args = p.parse_args(argv)
+
+    if args.set_password:
+        return set_password()
 
     if args.check_file:
         html = Path(args.check_file).read_text(encoding="utf-8", errors="replace")
