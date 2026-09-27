@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urljoin
@@ -47,10 +47,19 @@ USER_AGENT = (
 CONFIG_KEYS = ("GMAIL_USER", "GMAIL_APP_PASSWORD", "MAIL_TO", "EVENT_CD")
 MIN_INTERVAL = 30
 JITTER = 10
+MAX_BACKOFF = 15 * 60  # 429 が続いたときの最大待ち時間（秒）
 ERROR_ALERT_AFTER = timedelta(minutes=30)
 LOCK_PORT = 47613  # 常駐の二重起動防止用
 
 log = logging.getLogger("resale_watch")
+
+
+class RateLimited(Exception):
+    """ぴあから 429 Too Many Requests が返った。"""
+
+    def __init__(self, retry_after=None):
+        super().__init__(retry_after)
+        self.retry_after = retry_after
 
 
 # ---------- 設定 ----------
@@ -117,9 +126,22 @@ def fetch(url):
     })
     try:
         with urllib.request.urlopen(req, timeout=20) as res:
-            return res.status, res.read().decode("utf-8", errors="replace")
+            return res.status, res.read().decode("utf-8", errors="replace"), res.headers
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
+        return e.code, e.read().decode("utf-8", errors="replace"), e.headers
+
+
+def parse_retry_after(value):
+    """Retry-After ヘッダ（秒数または HTTP 日付）を秒に変換する。解釈できなければ None。"""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        return max(0, int((parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        return None
 
 
 def main_section(html):
@@ -246,10 +268,12 @@ def check_event(cd, state, label):
     """
     url = LIST_URL.format(cd)
     try:
-        status, html = fetch(url)
+        status, html, headers = fetch(url)
     except (urllib.error.URLError, OSError) as e:
         log.warning("%s: 取得失敗 %s", cd, e)
         return False, False
+    if status == 429:
+        raise RateLimited(parse_retry_after(headers.get("Retry-After") if headers else None))
     result = classify(status, html, url)
     if result["status"] == "unknown":
         log.warning("%s: unknown (%s)", cd, result["reason"])
@@ -273,14 +297,22 @@ def check_event(cd, state, label):
 def check_all(state_path, state, label):
     """全公演をチェックし、状態が変わっていれば保存する。
 
-    戻り値は (全件正常に取得・判定できたか, 例外（メール送信失敗など）が起きたか)。
+    戻り値は (全件正常に取得・判定できたか, 例外（メール送信失敗など）が起きたか,
+    429 を受けたか（受けていなければ None、受けたら Retry-After の秒数か 0）)。
     """
     ok = True
     crashed = False
     changed = False
+    rate_limited = None
     for cd in event_codes(get_config()):
         try:
             o, c = check_event(cd, state, label)
+        except RateLimited as e:
+            log.warning("%s: HTTP 429 (Too Many Requests)%s", cd,
+                        f" Retry-After={e.retry_after}秒" if e.retry_after is not None else "")
+            ok = False
+            rate_limited = e.retry_after or 0
+            break  # 制限中は残りの公演にもアクセスしない
         except Exception:
             log.exception("%s: チェック中にエラー", cd)
             o, c = False, False
@@ -289,12 +321,12 @@ def check_all(state_path, state, label):
         changed |= c
     if changed:
         save_state(state_path, state)
-    return ok, crashed
+    return ok, crashed, rate_limited
 
 
 def run_once(state_path, label):
     # 一時的な取得失敗では失敗扱いにしない（Actions の失敗メールが大量に来るのを防ぐ）
-    _, crashed = check_all(state_path, load_state(state_path), label)
+    _, crashed, _ = check_all(state_path, load_state(state_path), label)
     return 1 if crashed else 0
 
 
@@ -314,9 +346,11 @@ def run_loop(state_path, label, interval):
     state = load_state(state_path)
     fail_since = None
     error_notified = False
+    backoff = 0  # 429 が連続した回数
     while True:
+        rate_limited = None
         try:
-            ok, _ = check_all(state_path, state, label)
+            ok, _, rate_limited = check_all(state_path, state, label)
         except Exception:
             log.exception("チェック中にエラー")
             ok = False
@@ -338,7 +372,17 @@ def run_loop(state_path, label, interval):
         except Exception:
             log.exception("監視エラー通知の送信に失敗")
 
-        time.sleep(max(MIN_INTERVAL, interval + random.uniform(-JITTER, JITTER)))
+        if rate_limited is not None:
+            # 429 のたびに待ち時間を倍にする（60→120→240→480→900秒）。Retry-After があればそれ以上待つ
+            backoff += 1
+            wait = min(MAX_BACKOFF, max(rate_limited, interval * 2 ** backoff))
+            log.warning("アクセス制限を受けたため、次のチェックまで %d 秒待ちます", wait)
+        else:
+            if backoff:
+                log.info("アクセス制限が解除されたため、%d 秒間隔に戻します", interval)
+            backoff = 0
+            wait = max(MIN_INTERVAL, interval + random.uniform(-JITTER, JITTER))
+        time.sleep(wait)
 
 
 # ---------- エントリポイント ----------
